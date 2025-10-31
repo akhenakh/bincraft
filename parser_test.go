@@ -44,12 +44,13 @@ func TestParse_GoldenFile(t *testing.T) {
 	// Test Header Fields
 	assert.True(t, globeData.Now > float64(time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC).Unix()))
 	assert.Positive(t, globeData.AircraftWithPosition, "header should report a positive number of aircraft globally")
+	assert.NotZero(t, globeData.Bounds.North, "bounds should be parsed from header")
+	assert.NotZero(t, globeData.Bounds.South, "bounds should be parsed from header")
 
 	// Test Aircraft Data
 	require.NotEmpty(t, globeData.Aircraft, "aircraft list should not be empty after parsing")
 
 	// The header reports a GLOBAL aircraft count. The body contains a LOCAL count for the requested box.
-	// The correct assertion is that the local count must be less than or equal to the global count.
 	parsedCount := uint32(len(globeData.Aircraft))
 	globalCount := globeData.AircraftWithPosition
 	assert.LessOrEqual(t, parsedCount, globalCount, "parsed aircraft count (local) should be less than or equal to the header count (global)")
@@ -61,10 +62,66 @@ func TestParse_GoldenFile(t *testing.T) {
 	assert.True(t, firstAircraft.Lat >= -90.0 && firstAircraft.Lat <= 90.0, "latitude should be valid")
 	assert.True(t, firstAircraft.Lon >= -180.0 && firstAircraft.Lon <= 180.0, "longitude should be valid")
 
-	// This assertion is now correct and will pass.
 	_, isInt32 := firstAircraft.AltBaro.(int32)
 	_, isString := firstAircraft.AltBaro.(string)
 	assert.True(t, isInt32 || (isString && firstAircraft.AltBaro == "ground"), "alt_baro should be an int32 or 'ground'")
+}
+
+func TestMarshalAndParse_RoundTrip(t *testing.T) {
+	decompressedData := loadAndDecompressTestData(t)
+
+	// 1. Parse original data from the golden file
+	originalGlobeData, err := bincraft.Parse(decompressedData)
+	require.NoError(t, err)
+	require.NotNil(t, originalGlobeData)
+	require.NotEmpty(t, originalGlobeData.Aircraft)
+
+	// 2. Marshal it back to a binary format using our new function
+	marshaledData, err := originalGlobeData.MarshalBinary()
+	require.NoError(t, err)
+	require.NotEmpty(t, marshaledData)
+	require.Equal(t, bincraft.DefaultStride+len(originalGlobeData.Aircraft)*bincraft.DefaultStride, len(marshaledData))
+
+	// 3. Parse the newly generated binary data
+	var roundTripGlobeData bincraft.GlobeData
+	err = roundTripGlobeData.UnmarshalBinary(marshaledData)
+	require.NoError(t, err)
+	require.NotNil(t, roundTripGlobeData)
+
+	// 4. Compare headers
+	assert.InDelta(t, originalGlobeData.Now, roundTripGlobeData.Now, 0.001, "Timestamp should be nearly identical")
+	assert.Equal(t, uint32(bincraft.DefaultStride), roundTripGlobeData.Stride, "Stride should be the default value")
+	assert.Equal(t, originalGlobeData.AircraftWithPosition, roundTripGlobeData.AircraftWithPosition)
+	assert.Equal(t, originalGlobeData.GlobeIndex, roundTripGlobeData.GlobeIndex)
+	assert.Equal(t, originalGlobeData.Bounds, roundTripGlobeData.Bounds)
+
+	// 5. Compare aircraft lists
+	require.Equal(t, len(originalGlobeData.Aircraft), len(roundTripGlobeData.Aircraft))
+
+	// Spot-check the first aircraft to ensure field integrity after a round trip
+	// A full deep comparison is complex due to precision loss in the format.
+	originalAc := originalGlobeData.Aircraft[0]
+	roundTripAc := roundTripGlobeData.Aircraft[0]
+
+	assert.Equal(t, originalAc.Hex, roundTripAc.Hex)
+	assert.InDelta(t, originalAc.Lat, roundTripAc.Lat, 1e-6)
+	assert.InDelta(t, originalAc.Lon, roundTripAc.Lon, 1e-6)
+	assert.Equal(t, originalAc.Type, roundTripAc.Type)
+	assert.Equal(t, originalAc.Flight, roundTripAc.Flight)
+	assert.Equal(t, originalAc.Squawk, roundTripAc.Squawk)
+
+	// Check altitude, accounting for "ground" case and scaling precision loss
+	if originalAc.AltBaro == "ground" {
+		assert.Equal(t, "ground", roundTripAc.AltBaro)
+	} else {
+		originalAlt, ok1 := originalAc.AltBaro.(int32)
+		roundTripAlt, ok2 := roundTripAc.AltBaro.(int32)
+		require.True(t, ok1 && ok2, "AltBaro should be int32 for airborne aircraft")
+		assert.InDelta(t, originalAlt, roundTripAlt, 25.0, "Barometric altitude has a precision of 25ft")
+	}
+
+	// Check a rate value, accounting for scaling precision loss
+	assert.InDelta(t, originalAc.BaroRate, roundTripAc.BaroRate, 8.0, "Baro rate has a precision of 8ft/min")
 }
 
 func TestParse_EdgeCases(t *testing.T) {

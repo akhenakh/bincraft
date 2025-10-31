@@ -7,7 +7,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 )
+
+// DefaultStride is the expected size in bytes of a single aircraft record.
+// The format is fixed, so we use a constant for both reading and writing.
+const DefaultStride = 112
 
 // GlobeData represents the top-level structure of the parsed binary data.
 // It contains metadata about the data batch and a slice of aircraft.
@@ -24,6 +30,21 @@ type GlobeData struct {
 	Bounds Bounds `json:"bounds"`
 	// Aircraft is the list of aircraft parsed from the payload.
 	Aircraft []Aircraft `json:"aircraft"`
+}
+
+// MarshalBinary implements the encoding.BinaryMarshaler interface.
+func (g *GlobeData) MarshalBinary() ([]byte, error) {
+	return Encode(g)
+}
+
+// UnmarshalBinary implements the encoding.BinaryUnmarshaler interface.
+func (g *GlobeData) UnmarshalBinary(data []byte) error {
+	parsed, err := Parse(data)
+	if err != nil {
+		return err
+	}
+	*g = *parsed
+	return nil
 }
 
 // Bounds represents the geographic bounding box.
@@ -157,15 +178,26 @@ var aircraftTypeMap = map[uint8]string{
 	9: "adsr_other", 10: "tisb_trackfile", 11: "tisb_other", 12: "mode_ac",
 }
 
+var inverseAircraftTypeMap map[string]uint8
+var navModeBitMap = map[string]uint8{
+	"autopilot": 0x01, "vnav": 0x02, "alt_hold": 0x04,
+	"approach": 0x08, "lnav": 0x10, "tcas": 0x20,
+}
+
+func init() {
+	inverseAircraftTypeMap = make(map[string]uint8, len(aircraftTypeMap))
+	for code, name := range aircraftTypeMap {
+		inverseAircraftTypeMap[name] = code
+	}
+}
+
 // cleanStr converts a byte slice to a string, trimming null terminators
 // and filtering out non-printable characters.
 func cleanStr(b []byte) string {
-	// Find the first null byte, which indicates the end of a C-style string.
 	if i := bytes.IndexByte(b, 0); i != -1 {
 		b = b[:i]
 	}
 	var result []byte
-	// Filter for printable ASCII characters.
 	for _, char := range b {
 		if char > 32 && char < 127 {
 			result = append(result, char)
@@ -174,57 +206,51 @@ func cleanStr(b []byte) string {
 	return string(result)
 }
 
+// writeStringToBytes copies a string into a fixed-size byte slice, ensuring it's null-padded.
+func writeStringToBytes(dst []byte, src string) {
+	copy(dst, []byte(src))
+}
+
 // Parse decodes the binCraft binary data format into a GlobeData struct.
 func Parse(data []byte) (*GlobeData, error) {
-	// The header is at least 28 bytes long.
 	if len(data) < 28 {
 		return nil, fmt.Errorf("data too short for header")
 	}
-	// The stride is the length of each aircraft record, located at offset 8.
 	stride := binary.LittleEndian.Uint32(data[8:12])
 	if stride == 0 {
 		return nil, fmt.Errorf("invalid stride")
 	}
-	// The timestamp is a 64-bit value split into two 32-bit integers.
 	nowLow := binary.LittleEndian.Uint32(data[0:4])
 	nowHigh := binary.LittleEndian.Uint32(data[4:8])
 	acWithPosCount := binary.LittleEndian.Uint32(data[12:16])
 	globeIndex := binary.LittleEndian.Uint32(data[16:20])
 	result := &GlobeData{
-		// Reconstruct the full 64-bit timestamp.
 		Now:                  float64(nowLow)/1000.0 + float64(nowHigh)*4294967.296,
 		AircraftWithPosition: acWithPosCount,
 		GlobeIndex:           globeIndex,
 		Stride:               stride,
-		Bounds:               Bounds{ /* ... */ }, // Bounds are parsed in a different part of the codebase not shown here.
-		// Pre-allocate slice capacity for efficiency.
+		Bounds: Bounds{
+			South: int16(binary.LittleEndian.Uint16(data[20:22])),
+			West:  int16(binary.LittleEndian.Uint16(data[22:24])),
+			North: int16(binary.LittleEndian.Uint16(data[24:26])),
+			East:  int16(binary.LittleEndian.Uint16(data[26:28])),
+		},
 		Aircraft: make([]Aircraft, 0, (len(data)-int(stride))/int(stride)),
 	}
 
-	// Loop through the data, processing one aircraft record (chunk) at a time.
-	// The first aircraft record starts at an offset equal to the stride.
 	for offset := stride; offset+stride <= uint32(len(data)); offset += stride {
 		chunk := data[offset : offset+stride]
 		ac := Aircraft{}
-
-		// --- Decode Fixed-Width Fields ---
-
-		// The ICAO address is the lower 24 bits of a 32-bit integer.
 		addr := binary.LittleEndian.Uint32(chunk[0:4])
 		ac.Hex = fmt.Sprintf("%06x", addr&0xFFFFFF)
-
 		ac.SeenPos = float64(binary.LittleEndian.Uint16(chunk[4:6])) / 10.0
 		ac.Seen = float64(binary.LittleEndian.Uint16(chunk[6:8])) / 10.0
-		// Latitude and longitude are stored as scaled integers.
 		ac.Lon = float64(int32(binary.LittleEndian.Uint32(chunk[8:12]))) / 1e6
 		ac.Lat = float64(int32(binary.LittleEndian.Uint32(chunk[12:16]))) / 1e6
-
-		// Rates and altitudes are also scaled.
 		ac.BaroRate = int16(binary.LittleEndian.Uint16(chunk[16:18])) * 8
 		ac.GeomRate = int16(binary.LittleEndian.Uint16(chunk[18:20])) * 8
 		altBaroVal := int32(int16(binary.LittleEndian.Uint16(chunk[20:22]))) * 25
 		ac.AltGeom = int32(int16(binary.LittleEndian.Uint16(chunk[22:24]))) * 25
-
 		ac.NavAltitudeMCP = binary.LittleEndian.Uint16(chunk[24:26]) * 4
 		ac.NavAltitudeFMS = binary.LittleEndian.Uint16(chunk[26:28]) * 4
 		ac.NavQNH = float64(int16(binary.LittleEndian.Uint16(chunk[28:30]))) / 10.0
@@ -245,72 +271,48 @@ func Parse(data []byte) (*GlobeData, error) {
 		ac.IAS = binary.LittleEndian.Uint16(chunk[58:60])
 		ac.RC = binary.LittleEndian.Uint16(chunk[60:62])
 		ac.Messages = binary.LittleEndian.Uint16(chunk[62:64])
-
-		// --- Decode Bit-Packed Fields ---
-
-		// byte68 contains Airground status (lower 4 bits) and NavAltitudeSrc (upper 4 bits).
 		byte68 := chunk[68]
-		ac.Airground = byte68 & 0x0F // Mask for the lower 4 bits
+		ac.Airground = byte68 & 0x0F
 		if ac.Airground == 1 {
 			ac.AltBaro = "ground"
 		} else {
 			ac.AltBaro = altBaroVal
 		}
-		ac.NavAltitudeSrc = (byte68 & 0xF0) >> 4 // Mask for the upper 4 bits and shift
-
+		ac.NavAltitudeSrc = (byte68 & 0xF0) >> 4
 		rawCategory := chunk[64]
 		if rawCategory != 0 {
 			ac.Category = fmt.Sprintf("%X", rawCategory)
 		}
 		ac.NIC = chunk[65]
-
-		// byte67 contains Emergency (lower 4 bits) and Type (upper 4 bits).
 		byte67 := chunk[67]
 		ac.Emergency = byte67 & 0x0F
 		ac.Type = aircraftTypeMap[(byte67&0xF0)>>4]
-
-		// byte69 contains SILType (lower 4 bits) and ADSBVersion (upper 4 bits).
 		byte69 := chunk[69]
 		ac.SILType = byte69 & 0x0F
 		ac.ADSBVersion = (byte69 & 0xF0) >> 4
-
-		// byte70 contains ADSRVersion (lower 4 bits) and TISBVersion (upper 4 bits).
 		byte70 := chunk[70]
 		ac.ADSRVersion = byte70 & 0x0F
 		ac.TISBVersion = (byte70 & 0xF0) >> 4
-
-		// byte71 contains NACP (lower 4 bits) and NACV (upper 4 bits).
 		byte71 := chunk[71]
 		ac.NACP = byte71 & 0x0F
 		ac.NACV = (byte71 & 0xF0) >> 4
-
-		// byte72 contains multiple 2-bit fields.
 		byte72 := chunk[72]
-		ac.SIL = byte72 & 0x03         // bits 0-1
-		ac.GVA = (byte72 & 0x0C) >> 2  // bits 2-3
-		ac.SDA = (byte72 & 0x30) >> 4  // bits 4-5
-		ac.NICA = (byte72 & 0x40) >> 6 // bit 6
-		ac.NICC = (byte72 & 0x80) >> 7 // bit 7
-
-		// byte73 contains multiple 1-bit flags.
+		ac.SIL = byte72 & 0x03
+		ac.GVA = (byte72 & 0x0C) >> 2
+		ac.SDA = (byte72 & 0x30) >> 4
+		ac.NICA = (byte72 & 0x40) >> 6
+		ac.NICC = (byte72 & 0x80) >> 7
 		byte73 := chunk[73]
-		ac.NICBaro = byte73 & 1      // bit 0
-		ac.Alert = (byte73 & 2) >> 1 // bit 1
-		ac.SPI = (byte73 & 4) >> 2   // bit 2
-
-		// The RSSI formula is specific to this data source.
+		ac.NICBaro = byte73 & 1
+		ac.Alert = (byte73 & 2) >> 1
+		ac.SPI = (byte73 & 4) >> 2
 		rawRSSI := float64(chunk[86])
 		ac.RSSI = 10.0 * math.Log10((rawRSSI*rawRSSI)/65025.0+1.125e-5)
-
-		// --- Decode String and Other Fields ---
-
 		ac.DBFlags = chunk[87]
 		ac.Flight = cleanStr(chunk[78:87])
 		ac.TypeCode = cleanStr(chunk[88:92])
 		ac.Registration = cleanStr(chunk[92:104])
 		ac.ReceiverCount = chunk[104]
-
-		// byte66 is a bitmask for navigation modes.
 		navModesByte := chunk[66]
 		ac.NavModes = make([]string, 0)
 		if (navModesByte & 0x01) != 0 {
@@ -331,8 +333,132 @@ func Parse(data []byte) (*GlobeData, error) {
 		if (navModesByte & 0x20) != 0 {
 			ac.NavModes = append(ac.NavModes, "tcas")
 		}
-
 		result.Aircraft = append(result.Aircraft, ac)
 	}
 	return result, nil
+}
+
+// Encode converts a GlobeData struct into its binCraft binary representation.
+func Encode(g *GlobeData) ([]byte, error) {
+	stride := DefaultStride
+	bufSize := stride + len(g.Aircraft)*stride
+	buf := make([]byte, bufSize)
+
+	// --- Encode Header ---
+	totalMs := uint64(g.Now * 1000.0)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(totalMs))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(totalMs>>32))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(stride))
+	binary.LittleEndian.PutUint32(buf[12:16], g.AircraftWithPosition)
+	binary.LittleEndian.PutUint32(buf[16:20], g.GlobeIndex)
+	binary.LittleEndian.PutUint16(buf[20:22], uint16(g.Bounds.South))
+	binary.LittleEndian.PutUint16(buf[22:24], uint16(g.Bounds.West))
+	binary.LittleEndian.PutUint16(buf[24:26], uint16(g.Bounds.North))
+	binary.LittleEndian.PutUint16(buf[26:28], uint16(g.Bounds.East))
+
+	// --- Encode Aircraft ---
+	offset := stride
+	for _, ac := range g.Aircraft {
+		chunk := buf[offset : offset+stride]
+		addr, err := strconv.ParseUint(strings.TrimSpace(ac.Hex), 16, 24)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex %q: %w", ac.Hex, err)
+		}
+		binary.LittleEndian.PutUint32(chunk[0:4], uint32(addr))
+		binary.LittleEndian.PutUint16(chunk[4:6], uint16(ac.SeenPos*10.0))
+		binary.LittleEndian.PutUint16(chunk[6:8], uint16(ac.Seen*10.0))
+		binary.LittleEndian.PutUint32(chunk[8:12], uint32(int32(ac.Lon*1e6)))
+		binary.LittleEndian.PutUint32(chunk[12:16], uint32(int32(ac.Lat*1e6)))
+		binary.LittleEndian.PutUint16(chunk[16:18], uint16(ac.BaroRate/8))
+		binary.LittleEndian.PutUint16(chunk[18:20], uint16(ac.GeomRate/8))
+
+		var altBaroVal int32
+		var airground uint8 = 0 // default airborne
+		if str, ok := ac.AltBaro.(string); ok && str == "ground" {
+			airground = 1
+		} else if val, ok := ac.AltBaro.(int32); ok {
+			altBaroVal = val
+		} else if val, ok := ac.AltBaro.(int); ok { // Handle other numeric types
+			altBaroVal = int32(val)
+		} else if val, ok := ac.AltBaro.(float64); ok {
+			altBaroVal = int32(val)
+		}
+		binary.LittleEndian.PutUint16(chunk[20:22], uint16(altBaroVal/25))
+		binary.LittleEndian.PutUint16(chunk[22:24], uint16(ac.AltGeom/25))
+
+		binary.LittleEndian.PutUint16(chunk[24:26], ac.NavAltitudeMCP/4)
+		binary.LittleEndian.PutUint16(chunk[26:28], ac.NavAltitudeFMS/4)
+		binary.LittleEndian.PutUint16(chunk[28:30], uint16(int16(ac.NavQNH*10.0)))
+		binary.LittleEndian.PutUint16(chunk[30:32], uint16(int16(ac.NavHeading*90.0)))
+		sq, err := strconv.ParseUint(ac.Squawk, 16, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid squawk %q: %w", ac.Squawk, err)
+		}
+		binary.LittleEndian.PutUint16(chunk[32:34], uint16(sq))
+		binary.LittleEndian.PutUint16(chunk[34:36], uint16(int16(ac.GroundSpeed*10.0)))
+		binary.LittleEndian.PutUint16(chunk[36:38], uint16(int16(ac.Mach*1000.0)))
+		binary.LittleEndian.PutUint16(chunk[38:40], uint16(int16(ac.Roll*100.0)))
+		binary.LittleEndian.PutUint16(chunk[40:42], uint16(int16(ac.Track*90.0)))
+		binary.LittleEndian.PutUint16(chunk[42:44], uint16(int16(ac.TrackRate*100.0)))
+		binary.LittleEndian.PutUint16(chunk[44:46], uint16(int16(ac.MagHeading*90.0)))
+		binary.LittleEndian.PutUint16(chunk[46:48], uint16(int16(ac.TrueHeading*90.0)))
+		binary.LittleEndian.PutUint16(chunk[48:50], uint16(ac.WindDirection))
+		binary.LittleEndian.PutUint16(chunk[50:52], uint16(ac.WindSpeed))
+		binary.LittleEndian.PutUint16(chunk[52:54], uint16(ac.OAT))
+		binary.LittleEndian.PutUint16(chunk[54:56], uint16(ac.TAT))
+		binary.LittleEndian.PutUint16(chunk[56:58], ac.TAS)
+		binary.LittleEndian.PutUint16(chunk[58:60], ac.IAS)
+		binary.LittleEndian.PutUint16(chunk[60:62], ac.RC)
+		binary.LittleEndian.PutUint16(chunk[62:64], ac.Messages)
+
+		if ac.Category != "" {
+			cat, err := strconv.ParseUint(ac.Category, 16, 8)
+			if err == nil {
+				chunk[64] = byte(cat)
+			}
+		}
+		chunk[65] = ac.NIC
+
+		var navModesByte uint8
+		for _, mode := range ac.NavModes {
+			if bit, ok := navModeBitMap[mode]; ok {
+				navModesByte |= bit
+			}
+		}
+		chunk[66] = navModesByte
+
+		typeCode, ok := inverseAircraftTypeMap[ac.Type]
+		if !ok {
+			typeCode = 6 // "other"
+		}
+		chunk[67] = (typeCode << 4) | (ac.Emergency & 0x0F)
+		chunk[68] = (ac.NavAltitudeSrc << 4) | (airground & 0x0F)
+		chunk[69] = (ac.ADSBVersion << 4) | (ac.SILType & 0x0F)
+		chunk[70] = (ac.TISBVersion << 4) | (ac.ADSRVersion & 0x0F)
+		chunk[71] = (ac.NACV << 4) | (ac.NACP & 0x0F)
+		chunk[72] = ((ac.NICC & 0x01) << 7) | ((ac.NICA & 0x01) << 6) | ((ac.SDA & 0x03) << 4) | ((ac.GVA & 0x03) << 2) | (ac.SIL & 0x03)
+		chunk[73] = ((ac.SPI & 1) << 2) | ((ac.Alert & 1) << 1) | (ac.NICBaro & 1)
+
+		writeStringToBytes(chunk[78:87], ac.Flight) // 9 bytes (offset 86 is last byte)
+
+		pow10 := math.Pow(10, ac.RSSI/10.0)
+		xSquared := pow10 - 1.125e-5
+		if xSquared < 0 {
+			xSquared = 0
+		}
+		rawRSSI := math.Sqrt(xSquared) * 255.0
+		if rawRSSI > 255 {
+			rawRSSI = 255
+		}
+		chunk[86] = uint8(rawRSSI)
+
+		chunk[87] = ac.DBFlags
+		writeStringToBytes(chunk[88:92], ac.TypeCode)      // 4 bytes
+		writeStringToBytes(chunk[92:104], ac.Registration) // 12 bytes
+		chunk[104] = ac.ReceiverCount
+
+		offset += stride
+	}
+
+	return buf, nil
 }
