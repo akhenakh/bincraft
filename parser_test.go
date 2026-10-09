@@ -2,6 +2,7 @@ package bincraft_test
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -144,5 +145,74 @@ func TestParse_EdgeCases(t *testing.T) {
 		assert.NoError(t, err, "parsing header-only data should not error")
 		require.NotNil(t, globeData)
 		assert.Empty(t, globeData.Aircraft, "aircraft list should be empty for header-only data")
+	})
+}
+
+// record builds a one-aircraft payload with the given byte-73 flags and raw
+// altitudes, as readsb writes them (25 ft units).
+func record(flags uint8, baroFt, geomFt int16, seenPos int32) []byte {
+	data := make([]byte, 2*bincraft.DefaultStride)
+	binary.LittleEndian.PutUint32(data[8:12], bincraft.DefaultStride)
+	ac := data[bincraft.DefaultStride:]
+	binary.LittleEndian.PutUint32(ac[0:4], 0xae1238)
+	binary.LittleEndian.PutUint16(ac[20:22], uint16(baroFt/25))
+	binary.LittleEndian.PutUint16(ac[22:24], uint16(geomFt/25))
+	ac[73] = flags
+	binary.LittleEndian.PutUint32(ac[108:112], uint32(seenPos))
+	return data
+}
+
+func TestParse_Validity(t *testing.T) {
+	const baroValid, geomValid = 1 << 4, 1 << 5
+
+	t.Run("GeomInvalidIsNilNotZero", func(t *testing.T) {
+		// readsb zeroes geom_alt when it is not valid: a climbing aircraft
+		// with no current geometric altitude must not read as 0 ft HAE.
+		g, err := bincraft.Parse(record(baroValid, 4500, 0, 0))
+		require.NoError(t, err)
+		ac := g.Aircraft[0]
+		assert.Nil(t, ac.AltGeom)
+		assert.Equal(t, int32(4500), ac.AltBaro)
+
+		js, err := json.Marshal(ac)
+		require.NoError(t, err)
+		assert.NotContains(t, string(js), `"alt_geom"`)
+	})
+
+	t.Run("BaroInvalidIsNil", func(t *testing.T) {
+		// readsb leaves the last baro_alt in place when it is not valid.
+		g, err := bincraft.Parse(record(geomValid, 4500, 4700, 0))
+		require.NoError(t, err)
+		ac := g.Aircraft[0]
+		assert.Nil(t, ac.AltBaro)
+		require.NotNil(t, ac.AltGeom)
+		assert.Equal(t, int32(4700), *ac.AltGeom)
+	})
+
+	t.Run("BothValid", func(t *testing.T) {
+		g, err := bincraft.Parse(record(baroValid|geomValid, 4500, 0, 0))
+		require.NoError(t, err)
+		ac := g.Aircraft[0]
+		assert.Equal(t, int32(4500), ac.AltBaro)
+		require.NotNil(t, ac.AltGeom)
+		assert.Equal(t, int32(0), *ac.AltGeom, "a valid 0 stays 0")
+	})
+
+	t.Run("SeenPos", func(t *testing.T) {
+		g, err := bincraft.Parse(record(0, 0, 0, 7042))
+		require.NoError(t, err)
+		assert.InDelta(t, 704.2, float64(g.Aircraft[0].SeenPos), 1e-9)
+	})
+
+	t.Run("RoundTripKeepsValidity", func(t *testing.T) {
+		g, err := bincraft.Parse(record(baroValid, 4500, 0, 25))
+		require.NoError(t, err)
+		b, err := g.MarshalBinary()
+		require.NoError(t, err)
+		g2, err := bincraft.Parse(b)
+		require.NoError(t, err)
+		assert.Nil(t, g2.Aircraft[0].AltGeom)
+		assert.Equal(t, int32(4500), g2.Aircraft[0].AltBaro)
+		assert.InDelta(t, 2.5, float64(g2.Aircraft[0].SeenPos), 1e-9)
 	})
 }

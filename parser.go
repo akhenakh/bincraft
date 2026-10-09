@@ -5,11 +5,19 @@ package bincraft
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
 )
+
+type Float64 float64
+
+func (f Float64) MarshalJSON() ([]byte, error) {
+	rounded := math.Round(float64(f)*10) / 10
+	return json.Marshal(rounded)
+}
 
 // DefaultStride is the expected size in bytes of a single aircraft record.
 // The format is fixed, so we use a constant for both reading and writing.
@@ -60,17 +68,23 @@ type Aircraft struct {
 	// Hex is the ICAO 24-bit identifier of the aircraft, as a hex string.
 	Hex string `json:"hex"`
 	// SeenPos is the time in seconds since the last position update was received.
-	SeenPos float64 `json:"seen_pos"`
+	// binCraft carries the last reliable position even after it stops being
+	// current, so this is what tells a live position from a stale one.
+	SeenPos Float64 `json:"seen_pos"`
 	// Seen is the time in seconds since any message was last received from this aircraft.
-	Seen float64 `json:"seen"`
+	Seen Float64 `json:"seen"`
 	// Lat is the latitude of the aircraft in degrees.
 	Lat float64 `json:"lat"`
 	// Lon is the longitude of the aircraft in degrees.
 	Lon float64 `json:"lon"`
-	// AltBaro is the barometric altitude in feet, or the string "ground" if the aircraft is on the ground.
-	AltBaro interface{} `json:"alt_baro"`
-	// AltGeom is the geometric (WGS84) altitude in feet.
-	AltGeom int32 `json:"alt_geom"`
+	// AltBaro is the barometric altitude in feet, or the string "ground" if the
+	// aircraft is on the ground. nil when readsb flags it as not valid: the
+	// field then holds the last value received, however old.
+	AltBaro interface{} `json:"alt_baro,omitempty"`
+	// AltGeom is the geometric (WGS84) altitude in feet. nil when readsb flags
+	// it as not valid, which it encodes as 0 — read without the flag, that is an
+	// aircraft at the ellipsoid.
+	AltGeom *int32 `json:"alt_geom,omitempty"`
 	// BaroRate is the barometric vertical rate in feet per minute.
 	BaroRate int16 `json:"baro_rate"`
 	// GeomRate is the geometric vertical rate in feet per minute.
@@ -80,25 +94,25 @@ type Aircraft struct {
 	// NavAltitudeFMS is the Flight Management System (FMS) selected altitude in feet.
 	NavAltitudeFMS uint16 `json:"nav_altitude_fms"`
 	// NavQNH is the altimeter setting (QNH) in hPa (millibars).
-	NavQNH float64 `json:"nav_qnh"`
+	NavQNH Float64 `json:"nav_qnh"`
 	// NavHeading is the heading selected on the MCP/FCU, in degrees.
-	NavHeading float64 `json:"nav_heading"`
+	NavHeading Float64 `json:"nav_heading"`
 	// Squawk is the transponder code, as a 4-digit octal string.
 	Squawk string `json:"squawk"`
 	// GroundSpeed is the ground speed in knots.
-	GroundSpeed float64 `json:"gs"`
+	GroundSpeed Float64 `json:"gs"`
 	// Mach is the Mach number.
-	Mach float64 `json:"mach"`
+	Mach Float64 `json:"mach"`
 	// Roll is the roll angle in degrees. Negative values indicate left roll.
-	Roll float64 `json:"roll"`
+	Roll Float64 `json:"roll"`
 	// Track is the ground track in degrees.
-	Track float64 `json:"track"`
+	Track Float64 `json:"track"`
 	// TrackRate is the rate of turn in degrees per second.
-	TrackRate float64 `json:"track_rate"`
+	TrackRate Float64 `json:"track_rate"`
 	// MagHeading is the magnetic heading in degrees.
-	MagHeading float64 `json:"mag_heading"`
+	MagHeading Float64 `json:"mag_heading"`
 	// TrueHeading is the true heading in degrees.
-	TrueHeading float64 `json:"true_heading"`
+	TrueHeading Float64 `json:"true_heading"`
 	// WindDirection is the calculated wind direction in degrees.
 	WindDirection int16 `json:"wd"`
 	// WindSpeed is the calculated wind speed in knots.
@@ -150,7 +164,7 @@ type Aircraft struct {
 	// NICC is the Navigation Integrity Category Supplement C.
 	NICC uint8 `json:"nic_c"`
 	// RSSI is the Received Signal Strength Indicator in dBFS.
-	RSSI float64 `json:"rssi"`
+	RSSI Float64 `json:"rssi"`
 	// DBFlags are flags from the database.
 	DBFlags uint8 `json:"dbFlags"`
 	// Flight is the callsign or flight number.
@@ -170,6 +184,14 @@ type Aircraft struct {
 	// NavModes is a list of active navigation modes (e.g., "autopilot", "vnav").
 	NavModes []string `json:"nav_modes"`
 }
+
+// Validity bits in byte 73 of an aircraft record, from readsb's struct
+// binCraft (aircraft.h): bits 0-2 are nic_baro, alert and spi, then
+// callsign_valid, baro_alt_valid, geom_alt_valid, position_valid, gs_valid.
+const (
+	validBaroAlt uint8 = 1 << 4
+	validGeomAlt uint8 = 1 << 5
+)
 
 // aircraftTypeMap maps a numeric type identifier to its string representation.
 var aircraftTypeMap = map[uint8]string{
@@ -243,26 +265,26 @@ func Parse(data []byte) (*GlobeData, error) {
 		ac := Aircraft{}
 		addr := binary.LittleEndian.Uint32(chunk[0:4])
 		ac.Hex = fmt.Sprintf("%06x", addr&0xFFFFFF)
-		ac.SeenPos = float64(binary.LittleEndian.Uint16(chunk[4:6])) / 10.0
-		ac.Seen = float64(binary.LittleEndian.Uint16(chunk[6:8])) / 10.0
+		ac.Seen = Float64(int32(binary.LittleEndian.Uint32(chunk[4:8]))) / 10.0
+		ac.SeenPos = Float64(int32(binary.LittleEndian.Uint32(chunk[108:112]))) / 10.0
 		ac.Lon = float64(int32(binary.LittleEndian.Uint32(chunk[8:12]))) / 1e6
 		ac.Lat = float64(int32(binary.LittleEndian.Uint32(chunk[12:16]))) / 1e6
 		ac.BaroRate = int16(binary.LittleEndian.Uint16(chunk[16:18])) * 8
 		ac.GeomRate = int16(binary.LittleEndian.Uint16(chunk[18:20])) * 8
 		altBaroVal := int32(int16(binary.LittleEndian.Uint16(chunk[20:22]))) * 25
-		ac.AltGeom = int32(int16(binary.LittleEndian.Uint16(chunk[22:24]))) * 25
+		altGeomVal := int32(int16(binary.LittleEndian.Uint16(chunk[22:24]))) * 25
 		ac.NavAltitudeMCP = binary.LittleEndian.Uint16(chunk[24:26]) * 4
 		ac.NavAltitudeFMS = binary.LittleEndian.Uint16(chunk[26:28]) * 4
-		ac.NavQNH = float64(int16(binary.LittleEndian.Uint16(chunk[28:30]))) / 10.0
-		ac.NavHeading = float64(int16(binary.LittleEndian.Uint16(chunk[30:32]))) / 90.0
+		ac.NavQNH = Float64(int16(binary.LittleEndian.Uint16(chunk[28:30]))) / 10.0
+		ac.NavHeading = Float64(int16(binary.LittleEndian.Uint16(chunk[30:32]))) / 90.0
 		ac.Squawk = fmt.Sprintf("%04x", binary.LittleEndian.Uint16(chunk[32:34]))
-		ac.GroundSpeed = float64(int16(binary.LittleEndian.Uint16(chunk[34:36]))) / 10.0
-		ac.Mach = float64(int16(binary.LittleEndian.Uint16(chunk[36:38]))) / 1000.0
-		ac.Roll = float64(int16(binary.LittleEndian.Uint16(chunk[38:40]))) / 100.0
-		ac.Track = float64(int16(binary.LittleEndian.Uint16(chunk[40:42]))) / 90.0
-		ac.TrackRate = float64(int16(binary.LittleEndian.Uint16(chunk[42:44]))) / 100.0
-		ac.MagHeading = float64(int16(binary.LittleEndian.Uint16(chunk[44:46]))) / 90.0
-		ac.TrueHeading = float64(int16(binary.LittleEndian.Uint16(chunk[46:48]))) / 90.0
+		ac.GroundSpeed = Float64(int16(binary.LittleEndian.Uint16(chunk[34:36]))) / 10.0
+		ac.Mach = Float64(int16(binary.LittleEndian.Uint16(chunk[36:38]))) / 1000.0
+		ac.Roll = Float64(int16(binary.LittleEndian.Uint16(chunk[38:40]))) / 100.0
+		ac.Track = Float64(int16(binary.LittleEndian.Uint16(chunk[40:42]))) / 90.0
+		ac.TrackRate = Float64(int16(binary.LittleEndian.Uint16(chunk[42:44]))) / 100.0
+		ac.MagHeading = Float64(int16(binary.LittleEndian.Uint16(chunk[44:46]))) / 90.0
+		ac.TrueHeading = Float64(int16(binary.LittleEndian.Uint16(chunk[46:48]))) / 90.0
 		ac.WindDirection = int16(binary.LittleEndian.Uint16(chunk[48:50]))
 		ac.WindSpeed = int16(binary.LittleEndian.Uint16(chunk[50:52]))
 		ac.OAT = int16(binary.LittleEndian.Uint16(chunk[52:54]))
@@ -271,12 +293,20 @@ func Parse(data []byte) (*GlobeData, error) {
 		ac.IAS = binary.LittleEndian.Uint16(chunk[58:60])
 		ac.RC = binary.LittleEndian.Uint16(chunk[60:62])
 		ac.Messages = binary.LittleEndian.Uint16(chunk[62:64])
+		// Byte 73 carries readsb's validity bits alongside nic_baro, alert and
+		// spi; a value whose bit is clear is either zeroed or left stale.
+		byte73 := chunk[73]
+		baroAltValid := byte73&validBaroAlt != 0
+		geomAltValid := byte73&validGeomAlt != 0
 		byte68 := chunk[68]
 		ac.Airground = byte68 & 0x0F
 		if ac.Airground == 1 {
 			ac.AltBaro = "ground"
-		} else {
+		} else if baroAltValid {
 			ac.AltBaro = altBaroVal
+		}
+		if geomAltValid {
+			ac.AltGeom = &altGeomVal
 		}
 		ac.NavAltitudeSrc = (byte68 & 0xF0) >> 4
 		rawCategory := chunk[64]
@@ -302,12 +332,11 @@ func Parse(data []byte) (*GlobeData, error) {
 		ac.SDA = (byte72 & 0x30) >> 4
 		ac.NICA = (byte72 & 0x40) >> 6
 		ac.NICC = (byte72 & 0x80) >> 7
-		byte73 := chunk[73]
 		ac.NICBaro = byte73 & 1
 		ac.Alert = (byte73 & 2) >> 1
 		ac.SPI = (byte73 & 4) >> 2
 		rawRSSI := float64(chunk[86])
-		ac.RSSI = 10.0 * math.Log10((rawRSSI*rawRSSI)/65025.0+1.125e-5)
+		ac.RSSI = Float64(10.0 * math.Log10((rawRSSI*rawRSSI)/65025.0+1.125e-5))
 		ac.DBFlags = chunk[87]
 		ac.Flight = cleanStr(chunk[78:87])
 		ac.TypeCode = cleanStr(chunk[88:92])
@@ -365,8 +394,8 @@ func Encode(g *GlobeData) ([]byte, error) {
 			return nil, fmt.Errorf("invalid hex %q: %w", ac.Hex, err)
 		}
 		binary.LittleEndian.PutUint32(chunk[0:4], uint32(addr))
-		binary.LittleEndian.PutUint16(chunk[4:6], uint16(ac.SeenPos*10.0))
-		binary.LittleEndian.PutUint16(chunk[6:8], uint16(ac.Seen*10.0))
+		binary.LittleEndian.PutUint32(chunk[4:8], uint32(int32(math.Round(float64(ac.Seen)*10.0))))
+		binary.LittleEndian.PutUint32(chunk[108:112], uint32(int32(math.Round(float64(ac.SeenPos)*10.0))))
 		binary.LittleEndian.PutUint32(chunk[8:12], uint32(int32(ac.Lon*1e6)))
 		binary.LittleEndian.PutUint32(chunk[12:16], uint32(int32(ac.Lat*1e6)))
 		binary.LittleEndian.PutUint16(chunk[16:18], uint16(ac.BaroRate/8))
@@ -374,17 +403,26 @@ func Encode(g *GlobeData) ([]byte, error) {
 
 		var altBaroVal int32
 		var airground uint8 = 0 // default airborne
+		var validBits uint8
 		if str, ok := ac.AltBaro.(string); ok && str == "ground" {
 			airground = 1
 		} else if val, ok := ac.AltBaro.(int32); ok {
 			altBaroVal = val
+			validBits |= validBaroAlt
 		} else if val, ok := ac.AltBaro.(int); ok { // Handle other numeric types
 			altBaroVal = int32(val)
+			validBits |= validBaroAlt
 		} else if val, ok := ac.AltBaro.(float64); ok {
 			altBaroVal = int32(val)
+			validBits |= validBaroAlt
+		}
+		var altGeomVal int32
+		if ac.AltGeom != nil {
+			altGeomVal = *ac.AltGeom
+			validBits |= validGeomAlt
 		}
 		binary.LittleEndian.PutUint16(chunk[20:22], uint16(altBaroVal/25))
-		binary.LittleEndian.PutUint16(chunk[22:24], uint16(ac.AltGeom/25))
+		binary.LittleEndian.PutUint16(chunk[22:24], uint16(altGeomVal/25))
 
 		binary.LittleEndian.PutUint16(chunk[24:26], ac.NavAltitudeMCP/4)
 		binary.LittleEndian.PutUint16(chunk[26:28], ac.NavAltitudeFMS/4)
@@ -437,11 +475,11 @@ func Encode(g *GlobeData) ([]byte, error) {
 		chunk[70] = (ac.TISBVersion << 4) | (ac.ADSRVersion & 0x0F)
 		chunk[71] = (ac.NACV << 4) | (ac.NACP & 0x0F)
 		chunk[72] = ((ac.NICC & 0x01) << 7) | ((ac.NICA & 0x01) << 6) | ((ac.SDA & 0x03) << 4) | ((ac.GVA & 0x03) << 2) | (ac.SIL & 0x03)
-		chunk[73] = ((ac.SPI & 1) << 2) | ((ac.Alert & 1) << 1) | (ac.NICBaro & 1)
+		chunk[73] = validBits | ((ac.SPI & 1) << 2) | ((ac.Alert & 1) << 1) | (ac.NICBaro & 1)
 
 		writeStringToBytes(chunk[78:87], ac.Flight) // 9 bytes (offset 86 is last byte)
 
-		pow10 := math.Pow(10, ac.RSSI/10.0)
+		pow10 := math.Pow(10, float64(ac.RSSI)/10.0)
 		xSquared := pow10 - 1.125e-5
 		if xSquared < 0 {
 			xSquared = 0
